@@ -1,0 +1,201 @@
+# ASP.NET
+# Build and test ASP.NET projects.
+# Add steps that publish symbols, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/apps/aspnet/build-aspnet-4
+
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  clean_infraestructure: true
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Debug'
+  azureSubscriptionValue: 'myAzureConnection'
+  appServiceName: 'vulnerableWebAppServiceUB'
+  resourceGroupName: 'vulnerableWebApp-rg'
+  completeurl: https://$(appServiceName).azurewebsites.net 
+
+stages:
+  - stage: SetEnvironment
+    displayName: "Set up environment"
+    jobs:
+    - job: CreateAzureAppServiceInfra
+      steps:
+      - task: AzureCLI@2
+        displayName: "Create App Service"
+        inputs:
+          azureSubscription: '$(azureSubscriptionValue)'
+          scriptType: 'pscore'
+          scriptLocation: 'scriptPath'
+          scriptPath: 'infra_scripts/azure-infra-pipelines.ps1'
+  - stage: PrepareCode
+    displayName: "Compile and Test"
+    jobs:
+    - job: CompileAndTest
+      steps:
+      - task: NuGetToolInstaller@1
+      - task: NuGetCommand@2
+        inputs:
+          restoreSolution: '$(solution)'
+      - task: DotNetCoreCLI@2
+        displayName: Compile
+        inputs:
+          command: 'build'
+          projects: '$(solution)'
+          arguments: '-c $(buildConfiguration) -v normal'
+      - task: DotNetCoreCLI@2
+        displayName: Test
+        inputs:
+          command: 'test'
+          projects: '$(solution)'
+          arguments: '--no-build -c $(buildConfiguration) -v normal --logger "trx;logfilename=testResults.trx"'  
+  - stage: PublishandDeploy
+    displayName: "Publish & Deploy"
+    dependsOn:
+    - SetEnvironment
+    - PrepareCode
+    condition: and(succeeded('SetEnvironment'), succeeded('PrepareCode'))
+    jobs:
+    - job: Publish
+      steps:
+      - task: DotNetCoreCLI@2
+        displayName: "Publish"
+        inputs:
+          command: 'publish'
+          projects: "$(solution)"
+          arguments: "--configuration $(BuildConfiguration) -o $(Build.ArtifactStagingDirectory)/publish_output"
+          zipAfterPublish: True
+      - task: AzureRmWebAppDeployment@4
+        displayName: "Deploy to Azure"
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(azureSubscriptionValue)'
+          appType: 'webApp'
+          ResourceGroupName: '$(resourceGroupName)'
+          WebAppName: '$(appServiceName)'
+          Package: "$(Build.ArtifactStagingDirectory)/publish_output/*.zip"
+          RemoveAdditionalFilesFlag: true
+  - stage: ZAPAnalysis
+    displayName: "Dynamic App Security Test"
+    jobs:
+      - job: OWASP_ZAP
+        steps:
+        - task: owaspzap@1
+          displayName: 'Scan'
+          inputs:
+            aggressivemode: true
+            threshold: '1500'
+            scantype: 'targetedScan'
+            url: '$(completeurl)'
+            port: '443'
+        - task: Bash@3
+          displayName: 'Reporting Preparation'
+          inputs:
+            targetType: 'inline'
+            script: |
+              sudo npm install -g handlebars-cmd
+              
+              cat <<EOF > owaspzap/nunit-template.hbs
+              
+              <test-run
+                  id="2"
+                  name="Owasp test"
+                  start-time="{{@generated}}">
+                  {{#each site}}<test-suite
+                      id="{{@index}}"
+                      type="Assembly"
+                      name="{{[@name]}}"
+                      result="Failed"
+                      failed="{{alerts.length}}">
+                      <attachments>
+                          <attachment>
+                              <filePath>$BUILD_SOURCESDIRECTORY/owaspzap/report.html</filePath>
+                          </attachment>
+                      </attachments>
+                      {{#each alerts}}<test-case
+                          id="{{@index}}"
+                          name="{{alert}}"
+                          result="Failed"
+                          fullname="{{alert}}"
+                          time="1">
+                          <failure>
+                              <message>
+                                  <![CDATA[{{{desc}}}]]>
+                              </message>
+                              <stack-trace>
+                                  <![CDATA[
+              Solution:
+              {{{solution}}}
+              
+              Reference:
+              {{{reference}}}
+              
+              instances:{{#each instances}}
+              * {{uri}}
+                  - {{method}}
+                  {{#if evidence}}- {{{evidence}}}{{/if}}
+                                  {{/each}}]]>
+                              </stack-trace>
+                          </failure>
+                      </test-case>
+                      {{/each}}
+                  </test-suite>
+                  {{/each}}
+              </test-run>
+              EOF
+          condition: always() 
+        - task: Bash@3
+          displayName: 'Report Generation'          
+          inputs:
+            targetType: 'inline'
+            script: |
+              handlebars owaspzap/report.json < owaspzap/nunit-template.hbs > owaspzap/test-results.xml              
+            failOnStderr: true    
+        - task: Bash@3
+          displayName: 'List Reports'          
+          inputs:
+            targetType: 'inline'
+            script: |
+              ls -l owaspzap/*     
+        - task: Bash@3
+          displayName: 'Show report.json'          
+          inputs:
+            targetType: 'inline'
+            script: |
+              cat owaspzap/report.json
+        - task: Bash@3
+          displayName: 'Show test-results.xml'          
+          inputs:
+            targetType: 'inline'
+            script: |
+              cat owaspzap/test-results.xml      
+            failOnStderr: true          
+        - task: PublishTestResults@2
+          displayName: 'Publish Analysis Results'
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: 'owaspzap/test-results.xml'
+          condition: always()
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(System.DefaultWorkingDirectory)/owaspzap'
+            ArtifactName: 'drop'
+            publishLocation: 'Container'
+  - stage: CleanUP
+    condition: and(succeeded(), eq(variables.clean_infraestructure, true))
+    displayName: "clean infraestructure"
+    jobs:
+      - job: CLEAN_UP
+        steps:
+        - task: AzureResourceManagerTemplateDeployment@3
+          displayName: "Cleanup infraestructure"
+          inputs:
+            deploymentScope: 'Resource Group'
+            azureResourceManagerConnection: '$(azureSubscriptionValue)'
+            action: 'DeleteRG'
+            resourceGroupName: '$(resourceGroupName)'
+          
